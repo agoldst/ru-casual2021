@@ -1,0 +1,462 @@
+---
+title: "Twilight for tenure"
+date: 2021-11-08
+categories:
+  - work
+output:
+    hugormd::post:
+        highlight_shortcode: false
+        transparent_plots: true
+---
+
+```{r setup, include=F, cache=F}
+library(tidyverse)
+library(readxl)
+library(ggrepel)
+library(knitr)
+library(glue)
+opts_chunk$set(echo=F, cache=T, message=F, use_shortcode=F)
+```
+
+
+```{r utils}
+if (knitr::is_html_output()) {
+    pct <- function (x) scales::percent(x, suffix="%")
+} else { # latex
+    pct <- function (x) scales::percent(x, suffix="\\%")
+}
+
+big <- scales::label_comma()
+```
+
+```{r unitids}
+unitid_ru <- c(nb = 186380, nwk = 186399, cmd = 186371)
+unitid_runb <- 186380
+unitid_big10 <- c(
+    145637, #	University of Illinois at Urbana-Champaign
+    147767, #	Northwestern University
+    151351, #	Indiana University-Bloomington
+    153658, #	University of Iowa
+    163286, #	University of Maryland-College Park
+    170976, #	University of Michigan-Ann Arbor
+    171100, #	Michigan State University
+    174066, #	University of Minnesota-Twin Cities
+    181464, #	University of Nebraska-Lincoln
+    204796, #	Ohio State University-Main Campus
+    214777, #	Pennsylvania State University-Main Campus (through 2019)
+    495767, #   The Pennsylvania State University (merged 2020: all PSU)
+    240444, #	University of Wisconsin-Madison
+    243780, #	Purdue University-Main Campus
+    unitid_runb)
+```
+
+
+```{r download}
+data_dir <- "ipeds"
+if (!dir.exists(data_dir)) {
+    message("Creating data directory ", data_dir)
+    dir.create(data_dir)
+}
+
+years <- 2013:2020
+latest_year <- max(years)
+
+# take a vector of zip file names, download and extract data where not already
+# present, return a list of extracted files
+
+get_csvs <- function (fs) {
+    result <- fs
+    names(result) <- fs
+    for (zfile in fs) {
+        if (!file.exists(zfile)) {
+            url <- str_c("https://nces.ed.gov/ipeds/datacenter/data/",
+                         basename(zfile))
+            message("Downloading ", url)
+            download.file(url, zfile)
+            Sys.sleep(1) # don't shut down the federal government...'s server
+        }
+        flist <- unzip(zfile, list=T)[["Name"]]
+
+        # check for presence of revised data;
+        # derive extracted filename
+
+        rv <- str_detect(flist, "_rv")
+        if (sum(rv) > 1) {
+            stop("More than one _rv file found.")
+        }
+        else if (sum(rv) == 1) {
+            f <- flist[rv]
+        } else {
+            stopifnot(length(flist) == 1)
+            f <- flist
+        }
+        f <- file.path(data_dir, f)
+
+        if (!file.exists(f)) {
+            message("Extracting  ", f)
+            unzip(zfile, files=basename(f), exdir=data_dir)
+        }
+        result[zfile] <- f
+    }
+    result
+}
+
+get_ipeds <- function (prefix, years, suffix)
+    get_csvs(file.path(data_dir, str_c(prefix, years, suffix, ".zip")))
+
+sis_files <- get_ipeds("S", years, "_SIS")
+oc_files <- get_ipeds("S", years, "_OC")
+hd_file <- get_ipeds("HD", latest_year, "")
+efia_files <- get_ipeds("EFIA", years, "")
+
+```
+
+
+```{r load, message=F, warning=F}
+load_series <- function (fs) tibble(filename=fs) %>%
+    mutate(year=as.numeric(str_extract(filename, "\\d{4}"))) %>%
+    mutate(frm=map(filename, read_csv)) %>%
+    unnest(frm)
+
+
+instructional <- load_series(sis_files)
+staff <- load_series(oc_files)
+efia <- load_series(efia_files)
+chars <- read_csv(hd_file)
+```
+
+```{r ru-fte}
+ru_fte <- efia %>% filter(UNITID %in% unitid_ru) %>%
+    select(year, starts_with("FTE")) %>%
+    group_by(year) %>%
+    summarize(ug=sum(FTEUG), grad=sum(FTEGD), prof=sum(FTEDPP))
+```
+
+
+
+```{r teaching_categories}
+staffcats <- c(instructional=1210, # total of ft and pt teaching, not GAs
+               # ft_teaching=2210,
+               pt_teaching=3210,
+               ga_teaching=4410)
+
+total_teaching <- staff %>%
+    group_by(UNITID, year) %>%
+    filter(STAFFCAT %in% staffcats) %>%
+    mutate(STAFFCAT=factor(STAFFCAT,
+                           levels=staffcats,
+                           labels=names(staffcats))) %>%
+    select(UNITID, year, STAFFCAT, HRTOTLT) %>%
+    spread(STAFFCAT, HRTOTLT, fill=0) %>% # I think fill=0 is ok
+    mutate(teaching = instructional + ga_teaching)
+
+facstats <- c(tenured=20, tenure_track=30, ntt=40) # cf. S2020_SIS dictionary
+
+ttt <- instructional %>%
+    group_by(UNITID, year) %>%
+    filter(FACSTAT %in% facstats) %>%
+    mutate(FACSTAT=factor(FACSTAT, levels=facstats,
+                          labels=names(facstats))) %>%
+    select(UNITID, year, FACSTAT, SISTOTL) %>% 
+    spread(FACSTAT, SISTOTL, fill=0) # I think fill=0 is ok
+```
+
+```{r big10_fac}
+big10_fac <- chars %>%
+    filter(UNITID %in% unitid_big10) %>%
+    select(UNITID, INSTNM) %>%
+    inner_join(total_teaching, by="UNITID") %>%
+    inner_join(ttt, by=c("UNITID", "year")) %>%
+    mutate(INSTNM=str_replace(INSTNM, "University", "U")) %>%
+    mutate(INSTNM=str_replace(INSTNM, "-Main Campus", "")) %>%
+    mutate(INSTNM=str_replace(INSTNM, "The ", "")) %>%
+    mutate(frac_tenured=tenured / teaching,
+           frac_tt=tenure_track / teaching,
+           frac_ttt=(tenured + tenure_track) / teaching,
+           frac_ntt=ntt / teaching,
+           frac_pt=pt_teaching / teaching,
+           frac_ga=ga_teaching / teaching)
+```
+
+```{r ru_fac}
+ru_fac <- chars %>%
+    filter(UNITID %in% unitid_ru) %>%
+    select(UNITID, INSTNM) %>%
+    mutate(INSTNM=str_replace(INSTNM, "Rutgers University", "RU")) %>% 
+    inner_join(total_teaching, by="UNITID") %>%
+    inner_join(ttt, by=c("UNITID", "year")) %>%
+    mutate(frac_tenured=tenured / teaching,
+           frac_tt=tenure_track / teaching,
+           frac_ttt=(tenured + tenure_track) / teaching,
+           frac_ntt=ntt / teaching,
+           frac_pt=pt_teaching / teaching,
+           frac_ga=ga_teaching / teaching)
+```
+
+```{r firstlook_fac}
+firstlook_fac <- chars %>%
+    filter(PSET4FLG == 1) %>% # "first look": title IV, primarily post2ary
+    select(UNITID, INSTNM) %>%
+    inner_join(total_teaching, by="UNITID") %>%
+    inner_join(ttt, by=c("UNITID", "year")) %>%
+    filter(year == max(years)) %>% 
+    summarize(across(instructional:ntt, sum)) %>%
+    mutate(frac_tenured=tenured / teaching,
+           frac_tt=tenure_track / teaching,
+           frac_ttt=(tenured + tenure_track) / teaching,
+           frac_ntt=ntt / teaching,
+           frac_pt=pt_teaching / teaching,
+           frac_ga=ga_teaching / teaching)
+```
+
+```{r ru_staff_big10}
+rustaffcats <- c(
+    "part-time"="frac_pt",
+    "full-time non-tenure-track"="frac_ntt",
+    "tenured/tenure-track"="frac_ttt",
+    "TAs"="frac_ga")
+big10_fac %>%
+    mutate(runb=factor(UNITID == unitid_runb,
+                       levels=c(F, T),
+                       labels=c("Other Big 10", "Rutgers-New Brunswick"))) %>%
+    select(year, runb, UNITID, one_of(rustaffcats)) %>%
+    group_by(year, UNITID) %>%
+    gather("staff", "frac", -year, -runb, -UNITID) %>%
+    mutate(staff=factor(staff, levels=rustaffcats,
+                        labels=names(rustaffcats))) %>% 
+    ggplot(aes(year, frac, group=UNITID, color=runb, alpha=runb)) +
+        geom_line() + geom_point() +
+        facet_wrap(~ staff, nrow=1) +
+        scale_y_continuous(name="proportion of all instructional staff",
+                           labels=pct,
+                           limits=c(0, NA)) +
+        scale_color_manual(guide=guide_legend(title=NULL),
+                           values=c("black", "red")) +
+        scale_alpha_manual(guide=guide_legend(title=NULL),
+                           values=c(0.1, 1)) +
+        theme(legend.position="bottom",
+              strip.background=element_blank(),
+              panel.grid=element_blank(),
+              axis.text.x=element_text(angle=90, vjust=0.5)) +
+        labs(caption=str_wrap(
+"Proportion of instructional staff, including graduate TAs, in each category, for Big 10 universities. Rutgers-NB is in red. Penn State began reporting all campuses together in 2019. IPEDS data, graphic by Andrew Goldstone (andrewgoldstone.com)."))
+```
+
+This figure represents changes in the different types of instructors employed at Rutgers-New Brunswick since 2013 (the year Rutgers merged with the University of Medicine and Dentistry of New Jersey), with Rutgers's Big 10 "peer" campuses added for comparison. It spells bad news for tenure at Rutgers, and, since Rutgers is in many ways exemplary of national trends, bad news for the rest of US higher education too.
+
+<!--more-->
+
+As is well known, the institution of tenure for college and university faculty has diminished significantly over the past half-century---a trend known as _casualization_ because it turns secure jobs into contingent, "casual" appointments that may or may not be renewed. According to the AAUP, in 1976 higher-ed instructional staff were 45% tenured or tenure-track faculty (the remainder were graduate student instructors or non-tenure-track faculty, either full-time or part-time). Forty years later the proportion was 27%. By my reckoning, it was `r pct(firstlook_fac$frac_ttt)` in 2020.^[
+AAUP's calculations are summarized in an [April 2014 Report](https://www.aaup.org/sites/default/files/files/AAUP-InstrStaff2011-April2014.pdf) and updated through 2016 in a [2018 "Snapshot."](https://www.aaup.org/sites/default/files/10112018%20Data%20Snapshot%20Tenure.pdf) My calculation is based on IPEDS data for the `r sum(chars$PSET4FLG == 1)` Title IV-funded, primarily post-secondary institutions (the "First Look Universe"), which makes for slight discrepancies with the AAUP figures.]
+Over this time span, the dominant trend is the growth in part-time faculty positions, now the most numerous category of instructors overall (about `r pct(firstlook_fac$frac_pt)`). This trend is the reason it makes sense to speak of "adjunctification" as the crisis of university instruction.  The hyper-exploited adjunct, commuting between multiple campuses to scrape by, has become the icon of faculty degradation, and rightly so. Nothing more starkly represents the betrayal of the ideal of large-scale higher education than a PhD living hand-to-mouth and semester-to-semester while her increasingly indebted students wonder why their favorite professor doesn't seem to have an office on campus.
+
+Yet this is not the whole picture of the broad trend of casualization. The AAUP also notes the growth in _full-time_ non-tenure-track (NTT) appointments, in 1976 only 10% of all instructional staff, in 2011, 15.7%. Now, I calculate, the proportion is `r pct(firstlook_fac$frac_ntt)`. In recent years, full-time NTT growth outpaced part-time faculty growth, with the result that the proportion of part-time faculty has actually _decreased_ slightly in recent years. Contingency overall is on the increase, but its character is changing.^[These changes are not uniform over all types of institutions, needless to say. A fuller analysis of the divergences among institutions will have to wait for another time.]
+
+
+```{r ru-fac-diffs}
+ru_fac_diffs <- ru_fac %>% group_by(year) %>% summarize(across(instructional:ntt, sum)) %>% mutate(across(instructional:ntt, ~ .x - lag(.x)))
+```
+
+Rutgers has been on the cutting edge of both trends, making it a league leader in casualization. We have experienced adjunctification in spades: in 2016,
+`r ru_fac %>%
+    filter(year == 2016) %>%
+    summarize(sum(pt_teaching) / sum(teaching)) %>%
+    pull() %>%
+    pct()
+`
+of instructional staff were part-time faculty, trouncing the rest of the Big 10 conference (unlike in football). Up to then, there appeared to be no limit to the growth in the adjunct ranks at Rutgers.
+Yet something else happened. 2016 was the peak for such positions at Rutgers, which have declined in number in subsequent years, most drastically between 2019 and 2020. That decline combines both positive and negative developments. On the one hand, faculty, both part-time and full-time, successfully made an issue of adjunctification at Rutgers. We were able to win an increase in full-time positions in order to reduce the reliance on part-time instruction, for example in the large Writing Program in my own department. On the other hand, 2020 was a devastating year for Rutgers part-time faculty, whose numbers were reduced by
+`r ru_fac_diffs %>% filter(year == 2020) %>% pull(pt_teaching) %>% abs()`. (There was no compensating increase in other types of faculty positions.) Those losses were clearly due to the large-scale layoffs made at the start of the pandemic on the grounds of a spurious "fiscal emergency."
+
+```{r ru-fac-counts}
+ru_tot <- ru_fac %>% group_by(year) %>%
+    summarize(across(instructional:ntt, sum)) %>%
+    mutate(ttt=tenured + tenure_track)
+ru_tot %>%
+    select(-instructional, -teaching, -tenured, -tenure_track) %>%
+    pivot_longer(!year, names_to="type", values_to="count") %>%
+    mutate(type=fct_reorder2(type, year, count)) %>%
+    mutate(type=fct_recode(type,
+        "TA"="ga_teaching",
+        "Part-time"="pt_teaching",
+        "Full-time NTT"="ntt",
+        "tenured/tenure-track"="ttt")) %>%
+    ggplot(aes(year, count, color=type)) +
+        geom_point() + geom_line() +
+        scale_color_viridis_d() +
+        theme(panel.grid=element_blank()) +
+        labs(y="Number of instructors",
+             color="Category",
+             caption=str_wrap(
+"Instructional staff by category at all three Rutgers campuses. IPEDS data, graphic by Andrew Goldstone (andrewgoldstone.com)."))
+```
+    
+For both good and bad reasons, then, adjunctification appears to have plateaued at Rutgers. Instead, the university's ever-increasing instructional need is being met by hiring more full-time faculty---but _not_ faculty on the tenure track. T/TT (tenured/tenure-track) faculty are fewer now at Rutgers than they were in 2013, and they account for a little more than one quarter of all instructional personnel. Rather, it is the number of full-time NTT faculty that has grown apace; on the New Brunswick campus (in the first figure, above) there are more NTT instructional faculty than T/TT.
+
+This development can only be characterized as ambivalent. On the one hand, full-time non-tenure-track positions at Rutgers represent much better working conditions than part-time lectureships. NTTs and T/TT faculty are, with TAs and GAs, in the same union bargaining unit, and recent contracts have won very significant pay increases, promotion ladders, longer contract lengths, job protections, and other benefits for NTTs. In aggregate, working conditions for teaching---and job prospects for new PhDs---are improved by a shift from part-time faculty to NTTs.^[One would hope this shift also involved people who were PTLs moving to full-time jobs, but I suspect that has been quite rare. There is no institutionalized "pathway" from part- to full-time at Rutgers, and the separation of PTLs into another bargaining unit makes it challenging to produce one.]
+On the other hand, no headway has been made at all in tenure lines. Since 2013, Rutgers has increased its undergraduate student body size some
+`r ru_fte %>%
+    summarize(pct(last(ug) / first(ug) - 1)) %>% 
+    pull()
+` while decreasing its T/TT faculty by
+`r ru_tot %>%
+    summarize(pct(1 - last(ttt) / first(ttt))) %>%
+    pull()
+`.^[Via IPEDS. This represents a change in the total undergraduate full-time equivalents (FTEs) from
+`r big(first(ru_fte$ug))` to `r big(last(ru_fte$ug))`.]
+Rutgers-New Brunswick has been the unchallenged Big 10 champion for contingent instruction overall, with a higher total proportion of part-time and full-time non-tenure-track faculty combined than any of these "peer" schools:
+
+
+```{r big10_casual, fig.cap="", fig.pos="H"}
+cas_data <- big10_fac %>%
+    mutate(frac_casual = frac_pt + frac_ntt) %>% 
+    mutate(ru=factor(UNITID == unitid_runb,
+                     labels=c("Other Big 10", "RU-NB"))) %>%
+    mutate(INSTNM=fct_reorder2(INSTNM, year, frac_casual))
+
+ggplot(cas_data, aes(year, frac_casual, linetype=INSTNM, color=INSTNM)) +
+    geom_line() + geom_point(shape="circle open") +
+    geom_text_repel(
+        data=cas_data %>% filter(year == latest_year),
+        aes(year, frac_casual, label=INSTNM),
+        alpha=1, size=3,
+        hjust=0, direction="y", nudge_x=0.2,
+        segment.size=0.2, segment.alpha=0.25) +
+    scale_x_continuous(breaks=years, expand=expansion(add=c(1, 3))) +
+    scale_y_continuous(
+        name="proportion of part-or full-time NTT instructors",
+        limits=c(0, NA),
+        labels=pct) +
+    scale_linetype_manual(values=c(1:6, 1:6, 1:3), guide="none") +
+    scale_color_manual(values=rep(colorspace::qualitative_hcl(5), 3),
+                       guide="none") +
+    theme(panel.grid=element_blank()) +
+    labs(caption=str_wrap(
+"Proportion of instructors (including TAs) who are part-time or full-time non-tenure track faculty for each of the current Big 10 campuses. Penn State began reporting all campuses together in 2019. IPEDS data, graphic by Andrew Goldstone (andrewgoldstone.com)."))
+```
+
+Purdue, UIUC, and UMD are not, of course, paradises for tenure either. But their casualization pattern is different from Rutgers's: they rely heavily on graduate-student teaching.[^tas] 
+
+If we take all three of Rutgers's campuses together and compare them to the whole group of `r sum(chars$C18BASIC == 15)` research universities with "Very High" research activity (R1s, as they are still usually known), Rutgers again emerges as one of the heaviest users of contingent faculty, surpassed among public universities only by Temple:
+
+```{r r1-casual, comment=""}
+chars %>%
+    filter(C18BASIC == 15) %>%
+    select(UNITID) %>%
+    inner_join(total_teaching, by="UNITID") %>% 
+    inner_join(ttt, by=c("UNITID", "year")) %>% 
+    filter(year == latest_year) %>%
+    mutate(ttt=tenured + tenure_track) %>%
+    mutate(UNITID=ifelse(UNITID %in% unitid_ru, unitid_runb, UNITID)) %>%
+    group_by(UNITID) %>%
+    summarize(across(c(pt_teaching, ntt, ttt, teaching), sum)) %>%
+    mutate(frac_casual=(pt_teaching + ntt) / teaching,
+           frac_ttt=ttt / teaching) %>%
+    inner_join(chars %>% select(UNITID, INSTNM)) %>%
+    select(-UNITID) %>%
+    arrange(desc(frac_casual)) %>%
+    slice(1:10) %>%
+    mutate(INSTNM=str_replace(INSTNM,
+        " in the City of New York|-New Brunswick", "")) %>%
+    mutate(
+        across(starts_with("frac"), ~ scales::percent(.x, accuracy=0.1))) %>%
+    select("R1 University"=INSTNM,
+           "% PT/NTT"=frac_casual,
+           "% T/TT"=frac_ttt) %>%
+    kable(align="lrr")
+```
+
+The trend at Rutgers is clear: if things keep going as they have been in the last decade, casualization will continue, leaving, at most, a rump 25% of tenured faculty in place while ever more NTTs do ever more of the university's work---assuming, of course, that full-bore adjunctification does not pick up steam once again. Part-time faculty remain, after all, the largest and most-exploited group of instructors at Rutgers.
+
+But the rise of NTTs---which, though acute at Rutgers, is common across all of higher education and especially research universities---is very significant, just because it is _not_ as obviously scandalous as adjunctification.[^ru-ntt] It is possible for managers---and anyone else with an interest in diminishing the security, dignity, and power of higher-education faculty---to pretend that these comparatively good jobs are good enough for doing all the work of the university.
+It does not diminish the work NTTs do or my union's very significant advances in improving NTT working conditions to say that the transition to majority-non-tenurable full-time faculty is a bad outcome. It is a recipe for hollowing out the remnants of academic freedom and cementing the managerial university for good. Most obviously, NTTs as a whole teach more and are paid less than T/TT faculty. Yet even if true equal pay for equal work were achieved, though this would be an enormous improvement in the quality of work at Rutgers, NTTs would still, by definition, lack tenure. They lack true academic freedom, and they enter into university governance with management on very unequal terms; indeed, this disempowered status explains NTTs' inferior pay. And as long as the tiered system exists, all faculty members' academic freedom is precarious.
+
+Both the reasons and the methods for addressing NTTs' lack of true job security are straightforward. The argument for tenure is familiar, even if few people are persuaded by it outside academic circles. The general degradation of work has made relatively secure teaching jobs into easy targets of resentment (apparently easier than the rich thieves who are destroying our planet in order to enrich themselves even more). "Tenure" or just-cause employment should be more widespread across many kinds of work. But it remains true that teachers and researchers in particular cannot do their work properly if they are not protected from arbitrary firing. The whole society has an interest in teachers who are free to follow their expert judgment in their classrooms and researchers who are free to take long-term risks in pursuit of knowledge.
+
+Nor is it difficult to imagine a transition back to tenure at Rutgers, thanks to my union's successful campaign to define a promotion ladder with a review process (and grievances for non-renewal). This ladder is most of the way to being a process for awarding "teaching tenure" to Teaching Associate Professors and "research tenure" to Research Associate Professors. The institutional structure is already in place, and NTTs are waiting to become the secure faculty they should be, in the equitable conditions they should have.
+
+What's stopping us?  The general public may be much less easily swayed on this issue alone than they might be by the scandal of adjunctification, which so plainly degrades teaching. Nonetheless, we shouldn't give up hope in a New Deal for higher education that would reverse these baleful developments (and much else) at a national level, with provisions like the 25% maximum for non-tenure-track instruction (full- or part-time) in the [Sanders-Jayapal College for All Act](https://www.sanders.senate.gov/wp-content/uploads/AEG21437-2.pdf). Some of that looked like it might even make it into federal budget legislation. Then, of course, [King Coal intervened](https://www.aaup.org/news/next-steps-new-deal-higher-ed).
+
+At a local level, the causes of inertia are rather different.
+Management, naturally, fights anything that increases the power of faculty or the cost of their work. Increasing the proportion of tenured faculty would make us freer to challenge management's priorities (buildings, money-losing [athletics programs](/blog/athletics2021/), etc.) and to insist on using the university's resources for teaching and research instead.
+
+But the ambivalence of the rise of NTTs is also a challenge for academic labor because it lacks the appearance of crisis. If dozens of current tenured faculty at Rutgers had been converted to NTT status all at once, _that_ would have been explosive (and an illegal breach of contract). But that is not what happened. Instead, in the last eight years, without anyone making a public decision about it, dozens of tenure lines have not been replaced, and NTTs have been hired by the hundreds in order to serve an ever-growing student body.^[
+The exact figures are
+`r ru_fac %>% 
+    mutate(ttt = tenure_track + tenured) %>%
+    group_by(year) %>%
+    summarize(across(c(ttt, ntt), sum)) %>%
+    summarize(across(c(ttt, ntt),
+        .fns=list(
+            delta=~ abs(last(.x) - first(.x)),
+            chg=~ abs(last(.x) - first(.x)) / first(.x)
+        )
+    )) %>%
+    glue_data("{ttt_delta} T/TT positions lost since 2013, or {pct(ttt_chg)}, and {ntt_delta} NTT positions added, an increase of {pct(ntt_chg)}")
+`. 
+]
+It has been obvious, at least in my part of Rutgers, that assistant-professor hiring has been dwindling, but ordinary faculty life seems to go on: there are classes to teach, meetings to attend, research to be done (in the interstices of pandemic survival), [deans to berate](/blog/sas201015/)... All the burdens grow steadily heavier, all the best prospects recede further towards the horizon, but there has been no moment when tenure was obviously relegated for good. And though non-tenure-track faculty are overworked and undercompensated, their jobs are far superior to part-time lectureships, with tracks to promotion and a suite of contractual protections. In a time of multiple obvious social crises, the growth of NTTs doesn't leap out for urgency. 
+
+Furthermore, the tiered faculty system encourages tenured faculty especially to misperceive the situation, in a way that parallels the long-standing problem with talk about the failing academic job market. For T/TT faculty, the widespread feeling is that "our" numbers are dwindling and that there are fewer and fewer jobs on "the market." Whatever is happening is happening somewhere else. But that somewhere is actually our own campus: at Rutgers, the number of full-time faculty has been climbing and climbing, just as the national shift to contingency has entailed plenty of new jobs, just not the tenurable kind. 
+
+So it _is_ a crisis for the academic profession. And it will be our failure---and a victory for corporatizing management---if we cannot forge an "us" that joins tenurable and non-tenurable instructors together to fight for job security for all. Even if the internal divisions and ideological blockages are overcome, that fight will be exceedingly difficult to win. But the alternative is to allow casualization to proceed on its current plateau and right over the coming cliff.
+
+
+
+
+
+
+
+
+
+*Source code and instructions for reproducing the plots and numbers in this post may be found at <https://github.com/agoldst/ru-casual2021>.*
+
+[^ru-ntt]: Using the Carnegie classifications to divide universities according to the highest degree conferred, the growth in full-time non-tenure-track faculty across US higher education looks like this:
+
+    ```{r ru-ntt}
+    chars %>%
+        filter(PSET4FLG == 1, CONTROL %in% 1:2) %>% # "first look": title IV, primarily post2ary
+        select(UNITID, INSTNM, C18BASIC) %>%
+        inner_join(ttt, by="UNITID") %>%
+        mutate(kind=fct_collapse(as.character(C18BASIC),
+            associate=as.character(1:14),
+            doctoral=as.character(15:17),
+            masters=as.character(18:20),
+            baccalaureate=as.character(21:32),
+            tribal="33",
+            other_level="other")) %>%
+        group_by(year, kind) %>%
+        summarize(ntt=sum(ntt)) %>%
+        mutate(kind=fct_reorder2(kind, year, ntt)) %>%
+        ggplot(aes(year, ntt, color=kind)) +
+            geom_line() + geom_point() +
+            scale_y_continuous(labels=scales::label_comma()) +
+            scale_color_viridis_d(name="") +
+            theme(panel.grid=element_blank()) +
+            labs(y="Number of full-time NTT faculty",
+                 caption=str_wrap(
+    "Number of full-time non-tenure-track faculty, by year and institution type, for Title-IV, primarily post-secondary, not-for-profit institutions. Groupings are by Carnegie Classifications. IPEDS data, graphic by Andrew Goldstone (andrewgoldstone.com)."
+    ))
+    ```
+
+    The figure emphasizes the numerical dominance of staff at doctoral-degree-granting universities, though in relative terms there has been nearly comparable NTT growth in four-year colleges as well.
+
+[^tas]: If we consider TAs as well, Maryland beats Rutgers in the race to the bottom, but Rutgers's lower TA numbers do not necessarily reflect a lower level of graduate-student exploitation. Though the number of TAs has decreased significantly at Rutgers, the number of graduate students has not. After a big jump with the medical-school merger in 2013, graduate enrollment has been more or less level: according to IPEDS, graduate enrollment on all three campuses increased from 
+`r ru_fte %>%
+    filter(year %in% c(2013, 2020)) %>%
+    glue_data("{big(first(grad))} FTEs in 2013 to {big(last(grad))} in 2020",
+              " ({pct((last(grad) - first(grad)) / first(grad))} increase)")
+`
+while the number of TAs dropped from
+`r ru_fac %>%
+    select(UNITID, year, ga_teaching) %>%
+    group_by(year) %>%
+    summarize(ta=sum(ga_teaching)) %>%
+    filter(year %in% c(2013, 2020)) %>%
+    glue_data("{big(first(ta))} to {big(last(ta))}",
+              " ({pct((first(ta) - last(ta)) / first(ta))} decrease)")
+`.
+
+    Rutgers's union contract generally means the pay and benefits of TAs and GAs are superior to other forms of graduate support like fellowships or appointments as part-time lecturers. Graduate fellows are excluded from the union bargaining unit, though they shouldn't be; PTLs are in a separate bargaining unit with a separate contract, though they shouldn't be.
+    Moving graduate students off of TAs has been a way to attack the faculty-grad student union and cut costs. If fellows were paid at parity with TAs and covered by the union contract, many graduate students would probably prefer to be fellows in order to get on with their research. As it is, the trade-offs have made this another ambivalent development which, while variable in its impacts, has certainly contributed to adjunctification at Rutgers.
+
