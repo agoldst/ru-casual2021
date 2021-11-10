@@ -25,6 +25,8 @@ snip_fig := ru_staff_big10-1.png
 snip_src := $(post_files_source)/$(snip_fig)
 snip_target := /blog/$(target)/$(snip_src)
 
+# and we'll use sed to get the {{< figure >}} shortcodes back from pandoc's 
+# aggressive escaping
 
 $(md): $(Rmd)
 	R -e 'rmarkdown::render("$(Rmd)", output_file="$(md)")'
@@ -32,7 +34,9 @@ $(md): $(Rmd)
 	mv $(md) tmp/$(md)
 	sed -i .bak 's#$(snip_src)#$(snip_target)#' tmp/$(md)
 	pandoc tmp/$(md) -t markdown-raw_attribute -s -o $(md)
-	rm -rf tmp
+	sed -i .bak 's/{{\\</{{</' $(md)
+	sed -i .bak 's/\\>}}/>}}/' $(md)
+	rm -rf tmp $(md).bak
 
 ## Deployment ##
 

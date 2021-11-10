@@ -15,7 +15,7 @@ library(readxl)
 library(ggrepel)
 library(knitr)
 library(glue)
-opts_chunk$set(echo=F, cache=T, message=F, use_shortcode=F)
+opts_chunk$set(echo=F, cache=T, message=F, use_shortcode=T)
 ```
 
 
