@@ -280,7 +280,7 @@ ru_tot %>%
         "TA"="ga_teaching",
         "Part-time"="pt_teaching",
         "Full-time NTT"="ntt",
-        "tenured/tenure-track"="ttt")) %>%
+        "Tenured/tenure-track"="ttt")) %>%
     ggplot(aes(year, count, color=type)) +
         geom_point() + geom_line() +
         scale_color_viridis_d() +
